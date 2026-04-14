@@ -13,3 +13,11 @@
 #   varImportance - calcula la importancia de las variables (utilizando el método de Fischer 2015)
 #   saveModel - guarda un modelo en un fichero: saveModel(model, file_name)
 #   loadModel - carga un modelo desde un fichero: loadModel(fileName)
+
+# Librerías indispensables en la implementación anterior, actualizadas
+import time
+import numpy as np
+import random
+import torch
+from sklearn import model_selection as ms
+
