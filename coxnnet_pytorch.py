@@ -21,3 +21,6 @@ import random
 import torch
 from sklearn import model_selection as ms
 
+# Constante global para especificar si usamos la gpu como aceleradora o en el caso de que no haya una disponible usar cpu
+device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+
