@@ -19,8 +19,24 @@ import time
 import numpy as np
 import random
 import torch
+from torch import nn
 from sklearn import model_selection as ms
 
 # Constante global para especificar si usamos la gpu como aceleradora o en el caso de que no haya una disponible usar cpu
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
+class CoxMLP(nn.Module):
+    # Aquí se definen las capas de la NN
+    def __init__(self, n_input):
+        super().__init__()
+        self.linear_tanh_stack = nn.Sequential(
+            nn.Linear(n_input, 512),
+            nn.Tanh,
+            nn.Linear(512, 1)
+        )
+
+    # Y aquí se define como se avanza a través de la NN
+    def forward(self, x):
+        x = self.flatten(x)
+        logits = self.linear_tanh_stack(x)
+        return logits
