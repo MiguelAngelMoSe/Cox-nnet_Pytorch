@@ -17,6 +17,7 @@ import time
 import numpy as np
 import random
 import torch
+import matplotlib.pyplot as plt
 from torch import nn
 from sklearn import model_selection as ms
 
@@ -49,18 +50,19 @@ class CoxMLP(nn.Module):
 # Loss function en proceso, en este caso la función de negative_log_likelihood
 # cox_pred es el riesgo que nos devuelve el forward y ystatus es la variable estado de los datos, referida ha si han sufrido evento o no
 def negative_log_likelihood(cox_pred, ystatus):
-        
+
+    cox_pred = cox_pred.reshape(-1)
+    ystatus = ystatus.reshape(-1)
+
     exp_cox_pred = torch.exp(cox_pred)
 
-    accumulated_sum = torch.cumsum(torch.inverse(exp_cox_pred))
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_cox_pred, dims=[0]), dims=[0]), dims=[0])
 
-    log_acc_sum = torch.log(accumulated_sum)
+    log_acc_sum = torch.log(risk_sum)
 
-    subtraction = cox_pred - log_acc_sum
+    subtraction = (cox_pred - log_acc_sum) * ystatus
 
-    product_status = subtraction * ystatus
-
-    return -torch.mean(product_status)
+    return -torch.mean(subtraction)
 
 # Función para ordenar los datos de supervivencia de mayor supervivencia a menor para la loss function
 # Necesita los datos y un parámetro opcional device que usará cpu por defecto o el acelerador que se le pase
@@ -96,7 +98,7 @@ def defineSearchParams(search_params):
     return(method, learning_rate, momentum, lr_decay, lr_growth, eval_step, max_iter, stop_threshold, patience, patience_incr, rand_seed)
 
 # Función de entrenamiento
-def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), search_params = dict(), device="cpu", verbose=False):
+def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), search_params = dict(), device="cpu",graphic=False):
 
     device = device if torch.accelerator.is_available() else "cpu"
     L2_reg = l2
@@ -107,22 +109,80 @@ def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), se
     # Para darle al modelo un número de neuronas de entrada igual al número de columnas del dataset
     n_train = x_train.shape[1]
 
-
     ystatus_train_ordered, ytime_train_ordered, x_train_ordered = data_loader(x_train, ytime_train, ystatus_train, device)
 
     # Creamos el modelo y lo pasamos a device
     model = CoxMLP(n_train, n_hidden).to(device)
 
-    #cost = (negative_log_likelihood(model.forward(x_train_ordered), ystatus_train_ordered) + L2_reg * model.L2_sqr)
-
-    # Arreglar esta zona
+    # Se configura el optimizador, encargado de actualizar los parámetros basándose en los gradientes
     if method == "momentum":
-        updates = torch.optim.SGD(model.params, l_rate, momentum)
+        optimizer = torch.optim.SGD(params=model.parameters(),lr=l_rate,momentum=momentum,weight_decay=L2_reg)
         print("Using momentum gradient")
+
     elif method == "nesterov":
-        updates = torch.optim.SGD(model.params,nesterov=True, l_rate, momentum)
+        optimizer = torch.optim.SGD(params=model.parameters(),lr=l_rate,momentum=momentum,weight_decay=L2_reg,nesterov=True)
         print("Using nesterov accelerated gradient")
+
     else:
-        updates = torch.optim.SGD(model.params, l_rate, 0)
+        optimizer = torch.optim.SGD(params=model.parameters(),lr=l_rate,momentum=0,weight_decay=L2_reg)
         print("Using gradient descent")
-    return
+
+    best_loss = float('inf')
+    current_lr = l_rate
+    loss_values = []
+    start = time.time()
+
+    print("Training model")
+    for epoch in range(max_iter):
+
+        # Pasos a realizar en el entrenamiento, reiniciamos los gradientes
+        optimizer.zero_grad()
+    
+        # Extraemos predicción y el resultado de la loss function
+        pred = model(x_train_ordered)
+        loss = negative_log_likelihood(cox_pred=pred, ystatus=ystatus_train_ordered)
+
+        # Se propaga el error hacia atrás y se actualizan los pesos
+        loss.backward()
+        optimizer.step()
+
+        # Guardamos los valores para mostrarlos si quiere el usuario con graphic=True
+        loss_values.append(loss.item())
+
+        if epoch % eval_step == 0:
+
+            current_loss = loss.item()
+
+            if current_loss > best_loss:
+
+                current_lr *= lr_decay
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+            else:
+
+                current_lr *= lr_growth
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+            
+            if current_loss < best_loss * stop_threshold:
+                best_loss = current_loss
+                patience = max(patience, epoch * patience_incr)
+            
+            if epoch >= patience:
+                print(f"Early stopping in epoch: {epoch}")
+                break
+
+
+    print(('running time: %f seconds') % (time.time() - start))
+    print(('total epochs: %f') % (epoch))
+
+    if graphic:
+        fig, ax = plt.subplots(figsize=(8,5))
+        plt.plot(loss_values)
+        plt.title("Step-wise Loss")
+        plt.xlabel("Epochs")
+        plt.ylabel("Loss")
+        plt.show()
+    
+    return(model, loss_values)
+
