@@ -3,7 +3,6 @@
 #   CoxMlp - clase contenedora para la capa de salida y la capa oculta
 
 #Funciones: 
-#   createSharedDataset - función auxiliar para crear un conjunto de datos compartido en Theano (sujeta a cambios de Pytorch)
 #   trainCoxMlp - función principal para entrenar el modelo cox-nnet
 #   predictNewData - función para predecir nuevos datos
 #   L2CVSearch - función auxiliar para realizar validación cruzada en un conjunto de entrenamiento, para seleccionar el parámetro de regularización L2 óptimo.
@@ -30,7 +29,9 @@ class CoxMLP(nn.Module):
 
         if n_hidden == None:
             n_hidden = int(np.ceil(n_input ** 0.5))
-        
+
+        self.n_input = n_input
+        self.n_hidden = n_hidden
         # Modo manual
         self.input_layer = nn.Linear(n_input,n_hidden)
         self.tanh = nn.Tanh()
@@ -96,6 +97,17 @@ def defineSearchParams(search_params):
     rand_seed = search_params.get('rand_seed', 123) 
 
     return(method, learning_rate, momentum, lr_decay, lr_growth, eval_step, max_iter, stop_threshold, patience, patience_incr, rand_seed)
+
+# Función para dar valores por defecto a los parámetros de la validación cruzada
+def defineCVParams(cv_params):
+
+    cv_seed = cv_params.get('cv_seed', 1)
+    n_folds = cv_params.get('n_folds', 10) 
+    cv_metric = cv_params.get('cv_metric', "loglikelihood") 
+    search_iters = cv_params.get('search_iters', 3) 
+    L2_range = cv_params.get('L2_range', [-5,-1])
+
+    return(cv_seed, n_folds, cv_metric, search_iters, L2_range)
 
 # Función de entrenamiento
 def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), search_params = dict(), device="cpu",graphic=False):
@@ -186,3 +198,205 @@ def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), se
     
     return(model, loss_values)
 
+# Función necesaria para evaluar el modelo en conjuntos de prueba
+def predictNewData(model, x_test, device = "cpu"):
+
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    x_test_tensor = torch.as_tensor(x_test, dtype=torch.float32).to(device)
+
+    model.eval()
+
+    with torch.no_grad():
+        pred = model(x_test_tensor)
+    
+    np_pred = pred.numpy(force=True)
+
+    return np_pred.flatten()
+
+# Mide la verosimilitud logarítmica, métrica para identificar la calidad predictiva del modelo
+def CVLoglikelihood(model, x_full, ytime_full, ystatus_full, x_train, ytime_train, ystatus_train, device="cpu"):
+
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    # Para poder tener los datos de entrenamiento y validación juntos ordenados de mayor a menor supervivencia
+    ystatus_full_ordered, ytime_full_ordered, x_full_ordered = data_loader(x_train=x_full,ytime_train= ytime_full,ystatus_train= ystatus_full, device=device)
+
+    pred_full = predictNewData(model=model,x_test=x_full_ordered, device=device)
+
+    pred_full = torch.tensor(pred_full)
+
+    exp_pred_full = torch.exp(pred_full)
+
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_pred_full, dims=[0]), dims=[0]), dims=[0])
+
+    log_acc_sum = torch.log(risk_sum)
+
+    subtraction = torch.sum((pred_full - log_acc_sum) * ystatus_full_ordered)
+
+    ystatus_train_ordered, ytime_train_ordered, x_train_ordered = data_loader(x_train=x_train,ytime_train= ytime_train,ystatus_train= ystatus_train, device=device)
+    
+    pred_train = predictNewData(model=model,x_test=x_train_ordered, device=device)
+
+    pred_train = torch.tensor(pred_train)
+
+    exp_pred_train = torch.exp(pred_train)
+
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_pred_train, dims=[0]), dims=[0]), dims=[0])
+
+    log_acc_sum = torch.log(risk_sum)
+
+    subtraction2 = torch.sum((pred_train - log_acc_sum) * ystatus_train_ordered)
+    
+    return (subtraction-subtraction2)
+
+# Función para calcular el índice C, prácticamente igual que la antigua
+def CIndex(model, x_test, ytime_test, ystatus_test, device = "cpu"):
+
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    concord = 0.0
+    total = 0.0
+    N_test = int(ystatus_test.shape[0])
+
+    ystatus_test = np.asarray(ystatus_test, dtype=bool)
+    ytime_test = np.asarray(ytime_test)
+    theta = predictNewData(model=model,x_test=x_test,device=device)
+
+    for i in range(N_test):
+        if ystatus_test[i] == 1:
+            for j in range(N_test):
+                if ytime_test[j] > ytime_test[i]:
+                    total = total + 1
+                    if theta[j] < theta[i]: concord = concord + 1
+                    elif theta[j] == theta[i]: concord = concord + 0.5
+
+    return(concord/total)
+
+# Función para hacer la validación cruzada que se usará en L2CVProfile y en L2CVSearch
+def crossValidate(x_train, ytime_train, ystatus_train, n_hidden,l2=np.exp(-1), search_params = dict(),cv_params = dict(), device="cpu"):
+
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
+
+    N_train = int(ytime_train.shape[0])
+    cv_likelihoods = np.zeros([n_folds], dtype=np.dtype("float64"))
+    cv_folds= ms.KFold(n_splits=n_folds, shuffle=True, random_state=cv_seed)
+    k=0
+
+    for traincv, testcv in cv_folds.split(x_train):
+
+        x_train_cv = x_train[traincv]
+        ytime_train_cv = ytime_train[traincv]
+        ystatus_train_cv = ystatus_train[traincv]
+
+        model, loss_values = trainCoxMLP(x_train = x_train_cv, ytime_train = ytime_train_cv, ystatus_train = ystatus_train_cv, n_hidden=n_hidden,l2=l2, search_params = search_params,device=device,graphic=False)
+        
+        x_test_cv = x_train[testcv]
+        ytime_test_cv = ytime_train[testcv]
+        ystatus_test_cv = ystatus_train[testcv]
+        
+        if cv_metric == "loglikelihood":
+            cv_likelihoods[k] = CVLoglikelihood(model=model,x_full=x_train,ytime_full=ytime_train,ystatus_full=ystatus_train,x_train= x_train_cv,ytime_train= ytime_train_cv,ystatus_train= ystatus_train_cv,device=device)
+        else:
+            cv_likelihoods[k] = CIndex(model=model,x_test=x_test_cv,ytime_test= ytime_test_cv,ystatus_test= ystatus_test_cv, device=device)
+        k += 1     
+        
+    return(cv_likelihoods)
+
+# Función para obtener el mejor L2 de entre el rango que se le debe pasar
+def L2CVSearch(x_train, ytime_train, ystatus_train, n_hidden,search_params = dict(),cv_params = dict(),device="cpu"):
+    
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
+    
+    N_train = int(ytime_train.shape[0])
+    step_size = float(abs(L2_range[1] - L2_range[0]) / 2)
+    L2_reg = float(L2_range[0] + L2_range[1]) / 2
+    cv_likelihoods = np.zeros([0, n_folds], dtype=float)
+    L2_reg_params = np.zeros([0], dtype="float")
+    mean_cvpl = np.zeros([0], dtype="float")
+    #best_L2s = np.zeros([0], dtype="float")
+    
+    l2 = np.exp(L2_reg)
+    cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+    cv_likelihoods = np.concatenate((cv_likelihoods, [cvpl]), axis=0)
+    L2_reg_params = np.append(L2_reg_params,L2_reg)
+    mean_cvpl = np.append(mean_cvpl,np.mean(cvpl))
+    best_cvpl = np.mean(cvpl)
+    best_L2 = L2_reg
+
+    for i in range(search_iters):
+        step_size = step_size/2
+        #right
+        l2 = np.exp(best_L2 + step_size)
+        right_cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+        cv_likelihoods = np.concatenate((cv_likelihoods, [right_cvpl]), axis=0)
+        L2_reg_params = np.append(L2_reg_params,best_L2 + step_size)
+        mean_cvpl = np.append(mean_cvpl,np.mean(right_cvpl))
+        #left
+        l2 = np.exp(best_L2 - step_size)
+        left_cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+        cv_likelihoods = np.concatenate((cv_likelihoods, [left_cvpl]), axis=0)
+        L2_reg_params = np.append(L2_reg_params,best_L2 - step_size)
+        mean_cvpl = np.append(mean_cvpl,np.mean(left_cvpl))
+        
+        if np.mean(right_cvpl) > best_cvpl or np.mean(left_cvpl) > best_cvpl:
+            if np.mean(right_cvpl) > np.mean(left_cvpl):
+                best_cvpl = np.mean(right_cvpl)
+                best_L2 = best_L2 + step_size
+            else:
+                best_cvpl = np.mean(left_cvpl)
+                best_L2 = best_L2 - step_size
+
+    idx = np.argsort(L2_reg_params)
+    return(cv_likelihoods[idx], L2_reg_params[idx], mean_cvpl[idx])
+
+# Función para obtener el mejor l2
+def L2CVProfile(x_train, ytime_train, ystatus_train, n_hidden,search_params = dict(),cv_params = dict(), device="cpu"):
+    
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
+
+    N_train = int(ytime_train.shape[0])
+    
+    cv_likelihoods = np.zeros([len(L2_range), n_folds], dtype=float)
+    mean_cvpl = np.zeros(len(L2_range), dtype="float")
+    
+    for i in range(len(L2_range)):
+        l2 = np.exp(L2_range[i])
+        cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+        
+        cv_likelihoods[i] = cvpl
+        mean_cvpl[i] = np.mean(cvpl)
+        
+    return(cv_likelihoods, L2_range, mean_cvpl)
+
+# Función para obtener el mejor L2, pero compara más manualmente
+def L2Profile(x_train, ytime_train, ystatus_train, x_validation, ytime_validation, ystatus_validation, n_hidden,search_params = dict(),cv_params = dict(), device="cpu"):
+    
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
+    N_train = int(ytime_train.shape[0])
+    
+    likelihoods = []
+
+    x_full=np.concatenate([x_train, x_validation], axis=0)
+    ytime_full=np.concatenate([ytime_train, ytime_validation])
+    ystatus_full=np.concatenate([ystatus_train, ystatus_validation])
+    
+    for i in range(len(L2_range)):
+
+        l2 = np.exp(L2_range[i])
+        model, loss_values = trainCoxMLP(x_train = x_train, ytime_train = ytime_train, ystatus_train = ystatus_train, n_hidden = n_hidden,l2=l2, search_params = search_params, device=device)
+
+        if cv_metric == "loglikelihood":
+            likelihoods.append(CVLoglikelihood(model=model, x_full=x_full, ytime_full=ytime_full, ystatus_full=ystatus_full, x_train=x_train, ytime_train=ytime_train, ystatus_train=ystatus_train,device=device))
+        else:
+            likelihoods.append(CIndex(model= model, x_test=x_validation,ytime_test= ytime_validation,ystatus_test= ystatus_validation,device=device))
+        
+    return(likelihoods, L2_range)
