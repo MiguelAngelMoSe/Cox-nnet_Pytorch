@@ -400,3 +400,67 @@ def L2Profile(x_train, ytime_train, ystatus_train, x_validation, ytime_validatio
             likelihoods.append(CIndex(model= model, x_test=x_validation,ytime_test= ytime_validation,ystatus_test= ystatus_validation,device=device))
         
     return(likelihoods, L2_range)
+
+# Función que devuelve por orden de importancia las variables del dataset a la hora de predecir
+def varImportance(model, x_train, ytime_train, ystatus_train, device="cpu"):
+
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    ystatus_train_ordered, ytime_train_ordered, x_train_ordered = data_loader(x_train=x_train, ytime_train=ytime_train, ystatus_train=ystatus_train, device=device)
+    
+    theta = predictNewData(model=model, x_test = x_train_ordered, device=device)
+
+    tensor_theta = torch.tensor(theta)
+
+    exp_theta = torch.exp(tensor_theta)
+
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_theta, dims=[0]), dims=[0]), dims=[0])
+
+    log_acc_sum = torch.log(risk_sum)
+
+    PL_train = torch.sum((tensor_theta - log_acc_sum) * ystatus_train_ordered)
+    
+    x_train_ordered_np = x_train_ordered.numpy(force=True)
+    PL_mod = np.zeros([x_train_ordered_np.shape[1]])
+    
+    for k in range(x_train_ordered_np.shape[1]):
+        if (k+1) % 100 == 0:
+            print(str(k+1) + "...")
+            
+        xk_mean = np.mean(x_train_ordered_np[:,k])
+        xk_train = np.copy(x_train_ordered_np)
+        xk_train[:,k] = xk_mean
+    
+        new_theta = predictNewData(model=model, x_test = xk_train, device=device)
+
+        tensor_newtheta = torch.tensor(new_theta)
+
+        exp_newtheta = torch.exp(tensor_newtheta)
+
+        new_risk_sum = torch.flip(torch.cumsum(torch.flip(exp_newtheta, dims=[0]), dims=[0]), dims=[0])
+
+        new_log_acc_sum = torch.log(new_risk_sum)
+
+        PL_mod[k] = torch.sum((tensor_newtheta - new_log_acc_sum) * ystatus_train_ordered)
+        
+    return(PL_train - PL_mod)
+    
+# Función para guardar nuestro modelo entrenado en un fichero y no tenerlo que entrenarlo posteriormente
+def saveModel(model, file_name, device):
+
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    PATH = './' + file_name + '.pt'
+    torch.save(model.state_dict(), PATH)
+
+# Función para cargar nuestro modelo entrenado y poder usarlo sin entrenarlo de nuevo
+def loadModel(model,x_train,n_hidden,file_name,device="cpu"):
+    
+    device = device if torch.accelerator.is_available() else "cpu"
+
+    n_train = x_train.shape[1]
+    model = CoxMLP(n_input=n_train, n_hidden=n_hidden).to(device)
+
+    model.load_state_dict(torch.load(file_name))
+    model.eval()
+    return model
