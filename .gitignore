@@ -2,3 +2,6 @@
 *.ipynb
 .ipynb_checkpoints/
 *.pdf
+*.png
+*.csv
+*.xlsx

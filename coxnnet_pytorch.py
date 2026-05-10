@@ -14,7 +14,6 @@
 # Librerías indispensables en la implementación anterior, actualizadas
 import time
 import numpy as np
-import random
 import torch
 import matplotlib.pyplot as plt
 from torch import nn
@@ -24,29 +23,47 @@ from sklearn import model_selection as ms
 class CoxMLP(nn.Module):
     # Aquí se definen las capas de la NN
     # Necesitaremos: tamaño de entrada/número de columnas y (opcional) número neuronas capa oculta
-    def __init__(self, n_input, n_hidden):
+    def __init__(self, n_input, node_map):
         super().__init__()
 
-        if n_hidden == None:
-            n_hidden = int(np.ceil(n_input ** 0.5))
+        if node_map == None:
+            node_map = [int(np.ceil(n_input ** 0.5))]
+        elif not isinstance(node_map, list):
+            node_map = [node_map]
 
-        self.n_input = n_input
-        self.n_hidden = n_hidden
-        # Modo manual
-        self.input_layer = nn.Linear(n_input,n_hidden)
+        self.node_map = node_map
+        dim_pointer = n_input
+        empty_list = []
+
+        for i in node_map:
+
+            empty_list.append(nn.Linear(dim_pointer,i))
+            dim_pointer = i
+
+        self.layers = nn.ModuleList(empty_list)
         self.tanh = nn.Tanh()
-        self.output_layer = nn.Linear(n_hidden,1)
+        self.output_layer = nn.Linear(dim_pointer,1)
+        # Modo manual
+
+        # self.input_layer = nn.Linear(n_input,node_map.shape[0])
+        # self.hidden_layers = nn.ModuleList([nn.Linear(node_map.shape[i],node_map.shape[i+1]) for i in range(len(node_map)-1)])
+        # self.tanh = nn.Tanh()
+        # self.output_layer = nn.Linear(node_map.shape[-1],1)
 
     # Y aquí se define como se avanza a través de la NN
     def forward(self, input):
 
-        input_linear = self.input_layer(input)
+        iter_input = input
 
-        linear_tanh = self.tanh(input_linear)
+        for i in self.layers:
 
-        tanh_output = self.output_layer(linear_tanh)
+            input_linear = i(iter_input)
 
-        return tanh_output
+            iter_input = self.tanh(input_linear)
+            
+        output = self.output_layer(iter_input)
+
+        return output
     
 # Loss function en proceso, en este caso la función de negative_log_likelihood
 # cox_pred es el riesgo que nos devuelve el forward y ystatus es la variable estado de los datos, referida ha si han sufrido evento o no
@@ -57,8 +74,8 @@ def negative_log_likelihood(cox_pred, ystatus):
 
     exp_cox_pred = torch.exp(cox_pred)
 
-    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_cox_pred, dims=[0]), dims=[0]), dims=[0])
-
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_cox_pred, dims=[0]), dim=0), dims=[0])
+    
     log_acc_sum = torch.log(risk_sum)
 
     subtraction = (cox_pred - log_acc_sum) * ystatus
@@ -73,13 +90,20 @@ def data_loader(x_train,ytime_train,ystatus_train, device="cpu"):
     ystatus_tensor = torch.from_numpy(ystatus_train).float()
     x_tensor = torch.tensor(x_train).float()
 
-    time_index = torch.argsort(ytime_tensor,descending=True)
+    time_index = torch.argsort(ytime_tensor,descending=False)
 
     ystatus_train_ordered = ystatus_tensor[time_index]
     ytime_train_ordered = ytime_tensor[time_index]
     x_train_ordered = x_tensor[time_index]
 
     return ystatus_train_ordered.to(device), ytime_train_ordered.to(device), x_train_ordered.to(device)
+
+# Función para definir por defecto L2 y las capas ocultas y neuronas de cada capa
+def defineModelParams(model_params):
+
+    L2_reg = model_params.get('L2_reg', np.exp(-1))
+    node_map = model_params.get('node_map', None)
+    return(L2_reg, node_map)
 
 # Función para darle valores por defecto a la configuración del entrenamiento, igual que la antigua versión
 def defineSearchParams(search_params):
@@ -110,10 +134,12 @@ def defineCVParams(cv_params):
     return(cv_seed, n_folds, cv_metric, search_iters, L2_range)
 
 # Función de entrenamiento
-def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), search_params = dict(), device="cpu",graphic=False):
+def trainCoxMLP(x_train, ytime_train, ystatus_train, model_params=dict(), search_params = dict(), device="cpu",graphic=False):
 
     device = device if torch.accelerator.is_available() else "cpu"
-    L2_reg = l2
+
+    L2_reg, node_map = defineModelParams(model_params=model_params)
+
     method, l_rate, momentum, lr_decay, lr_growth, eval_step, max_iter, stop_threshold, patience, patience_incr, rand_seed = defineSearchParams(search_params)
     # Para que los pesos sean los mismos siempre al empezar
     torch.manual_seed(rand_seed)
@@ -124,7 +150,7 @@ def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), se
     ystatus_train_ordered, ytime_train_ordered, x_train_ordered = data_loader(x_train, ytime_train, ystatus_train, device)
 
     # Creamos el modelo y lo pasamos a device
-    model = CoxMLP(n_train, n_hidden).to(device)
+    model = CoxMLP(n_input=n_train, node_map=node_map).to(device)
 
     # Se configura el optimizador, encargado de actualizar los parámetros basándose en los gradientes
     if method == "momentum":
@@ -183,8 +209,7 @@ def trainCoxMLP(x_train, ytime_train, ystatus_train, n_hidden, l2=np.exp(-1), se
             if epoch >= patience:
                 print(f"Early stopping in epoch: {epoch}")
                 break
-
-
+ 
     print(('running time: %f seconds') % (time.time() - start))
     print(('total epochs: %f') % (epoch))
 
@@ -208,7 +233,7 @@ def predictNewData(model, x_test, device = "cpu"):
     model.eval()
 
     with torch.no_grad():
-        pred = model(x_test_tensor)
+        pred = model(input=x_test_tensor)
     
     np_pred = pred.numpy(force=True)
 
@@ -224,11 +249,14 @@ def CVLoglikelihood(model, x_full, ytime_full, ystatus_full, x_train, ytime_trai
 
     pred_full = predictNewData(model=model,x_test=x_full_ordered, device=device)
 
-    pred_full = torch.tensor(pred_full)
+    if not torch.is_tensor(pred_full):
+        pred_full = torch.from_numpy(pred_full).to(device)
+    else:
+        pred_full = pred_full.to(device)
 
     exp_pred_full = torch.exp(pred_full)
 
-    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_pred_full, dims=[0]), dims=[0]), dims=[0])
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_pred_full, dims=[0]), dim=0), dims=[0])
 
     log_acc_sum = torch.log(risk_sum)
 
@@ -238,11 +266,14 @@ def CVLoglikelihood(model, x_full, ytime_full, ystatus_full, x_train, ytime_trai
     
     pred_train = predictNewData(model=model,x_test=x_train_ordered, device=device)
 
-    pred_train = torch.tensor(pred_train)
+    if not torch.is_tensor(pred_train):
+        pred_train = torch.from_numpy(pred_train).to(device)
+    else:
+        pred_train = pred_train.to(device)
 
     exp_pred_train = torch.exp(pred_train)
 
-    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_pred_train, dims=[0]), dims=[0]), dims=[0])
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_pred_train, dims=[0]), dim=0), dims=[0])
 
     log_acc_sum = torch.log(risk_sum)
 
@@ -274,10 +305,11 @@ def CIndex(model, x_test, ytime_test, ystatus_test, device = "cpu"):
     return(concord/total)
 
 # Función para hacer la validación cruzada que se usará en L2CVProfile y en L2CVSearch
-def crossValidate(x_train, ytime_train, ystatus_train, n_hidden,l2=np.exp(-1), search_params = dict(),cv_params = dict(), device="cpu"):
+def crossValidate(x_train, ytime_train, ystatus_train, model_params = dict(), search_params = dict(),cv_params = dict(), device="cpu"):
 
     device = device if torch.accelerator.is_available() else "cpu"
 
+    L2_reg, node_map = defineModelParams(model_params=model_params)
     cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
 
     N_train = int(ytime_train.shape[0])
@@ -291,7 +323,7 @@ def crossValidate(x_train, ytime_train, ystatus_train, n_hidden,l2=np.exp(-1), s
         ytime_train_cv = ytime_train[traincv]
         ystatus_train_cv = ystatus_train[traincv]
 
-        model, loss_values = trainCoxMLP(x_train = x_train_cv, ytime_train = ytime_train_cv, ystatus_train = ystatus_train_cv, n_hidden=n_hidden,l2=l2, search_params = search_params,device=device,graphic=False)
+        model, loss_values = trainCoxMLP(x_train = x_train_cv, ytime_train = ytime_train_cv, ystatus_train = ystatus_train_cv, model_params=model_params, search_params = search_params,device=device,graphic=False)
         
         x_test_cv = x_train[testcv]
         ytime_test_cv = ytime_train[testcv]
@@ -306,9 +338,11 @@ def crossValidate(x_train, ytime_train, ystatus_train, n_hidden,l2=np.exp(-1), s
     return(cv_likelihoods)
 
 # Función para obtener el mejor L2 de entre el rango que se le debe pasar
-def L2CVSearch(x_train, ytime_train, ystatus_train, n_hidden,search_params = dict(),cv_params = dict(),device="cpu"):
+def L2CVSearch(x_train, ytime_train, ystatus_train, model_params = dict(),search_params = dict(),cv_params = dict(),device="cpu"):
     
     device = device if torch.accelerator.is_available() else "cpu"
+
+    L2_reg, node_map = defineModelParams(model_params)
 
     cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
     
@@ -319,9 +353,10 @@ def L2CVSearch(x_train, ytime_train, ystatus_train, n_hidden,search_params = dic
     L2_reg_params = np.zeros([0], dtype="float")
     mean_cvpl = np.zeros([0], dtype="float")
     #best_L2s = np.zeros([0], dtype="float")
-    
-    l2 = np.exp(L2_reg)
-    cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+
+    mp_copy = model_params.copy()
+    mp_copy['L2_reg'] = np.exp(L2_reg)
+    cvpl = crossValidate(x_train, ytime_train, ystatus_train,model_params=mp_copy, search_params=search_params,cv_params= cv_params, device=device)
     cv_likelihoods = np.concatenate((cv_likelihoods, [cvpl]), axis=0)
     L2_reg_params = np.append(L2_reg_params,L2_reg)
     mean_cvpl = np.append(mean_cvpl,np.mean(cvpl))
@@ -331,14 +366,14 @@ def L2CVSearch(x_train, ytime_train, ystatus_train, n_hidden,search_params = dic
     for i in range(search_iters):
         step_size = step_size/2
         #right
-        l2 = np.exp(best_L2 + step_size)
-        right_cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+        mp_copy['L2_reg'] = np.exp(best_L2 + step_size)
+        right_cvpl = crossValidate(x_train, ytime_train, ystatus_train,model_params=mp_copy, search_params=search_params,cv_params= cv_params, device=device)
         cv_likelihoods = np.concatenate((cv_likelihoods, [right_cvpl]), axis=0)
         L2_reg_params = np.append(L2_reg_params,best_L2 + step_size)
         mean_cvpl = np.append(mean_cvpl,np.mean(right_cvpl))
         #left
-        l2 = np.exp(best_L2 - step_size)
-        left_cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+        mp_copy['L2_reg'] = np.exp(best_L2 - step_size)
+        left_cvpl = crossValidate(x_train, ytime_train, ystatus_train,model_params=mp_copy, search_params=search_params,cv_params= cv_params, device=device)
         cv_likelihoods = np.concatenate((cv_likelihoods, [left_cvpl]), axis=0)
         L2_reg_params = np.append(L2_reg_params,best_L2 - step_size)
         mean_cvpl = np.append(mean_cvpl,np.mean(left_cvpl))
@@ -355,10 +390,12 @@ def L2CVSearch(x_train, ytime_train, ystatus_train, n_hidden,search_params = dic
     return(cv_likelihoods[idx], L2_reg_params[idx], mean_cvpl[idx])
 
 # Función para obtener el mejor l2
-def L2CVProfile(x_train, ytime_train, ystatus_train, n_hidden,search_params = dict(),cv_params = dict(), device="cpu"):
+def L2CVProfile(x_train, ytime_train, ystatus_train, model_params = dict(),search_params = dict(),cv_params = dict(), device="cpu"):
     
     device = device if torch.accelerator.is_available() else "cpu"
 
+    L2_reg, node_map = defineModelParams(model_params)
+    mp_copy = model_params.copy()
     cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
 
     N_train = int(ytime_train.shape[0])
@@ -367,8 +404,8 @@ def L2CVProfile(x_train, ytime_train, ystatus_train, n_hidden,search_params = di
     mean_cvpl = np.zeros(len(L2_range), dtype="float")
     
     for i in range(len(L2_range)):
-        l2 = np.exp(L2_range[i])
-        cvpl = crossValidate(x_train, ytime_train, ystatus_train,n_hidden=n_hidden, l2=l2, search_params=search_params,cv_params= cv_params, device=device)
+        mp_copy['L2_reg'] = np.exp(L2_range[i])
+        cvpl = crossValidate(x_train, ytime_train, ystatus_train,model_params=mp_copy, search_params=search_params,cv_params= cv_params, device=device)
         
         cv_likelihoods[i] = cvpl
         mean_cvpl[i] = np.mean(cvpl)
@@ -376,10 +413,12 @@ def L2CVProfile(x_train, ytime_train, ystatus_train, n_hidden,search_params = di
     return(cv_likelihoods, L2_range, mean_cvpl)
 
 # Función para obtener el mejor L2, pero compara más manualmente
-def L2Profile(x_train, ytime_train, ystatus_train, x_validation, ytime_validation, ystatus_validation, n_hidden,search_params = dict(),cv_params = dict(), device="cpu"):
+def L2Profile(x_train, ytime_train, ystatus_train, x_validation, ytime_validation, ystatus_validation, model_params= dict(),search_params = dict(),cv_params = dict(), device="cpu"):
     
     device = device if torch.accelerator.is_available() else "cpu"
 
+    L2_reg, node_map = defineModelParams(model_params)
+    mp_copy = model_params.copy()
     cv_seed, n_folds, cv_metric, search_iters, L2_range = defineCVParams(cv_params)
     N_train = int(ytime_train.shape[0])
     
@@ -391,8 +430,8 @@ def L2Profile(x_train, ytime_train, ystatus_train, x_validation, ytime_validatio
     
     for i in range(len(L2_range)):
 
-        l2 = np.exp(L2_range[i])
-        model, loss_values = trainCoxMLP(x_train = x_train, ytime_train = ytime_train, ystatus_train = ystatus_train, n_hidden = n_hidden,l2=l2, search_params = search_params, device=device)
+        mp_copy['L2_reg'] = np.exp(L2_range[i])
+        model, loss_values = trainCoxMLP(x_train = x_train, ytime_train = ytime_train, ystatus_train = ystatus_train, model_params=mp_copy, search_params = search_params, device=device)
 
         if cv_metric == "loglikelihood":
             likelihoods.append(CVLoglikelihood(model=model, x_full=x_full, ytime_full=ytime_full, ystatus_full=ystatus_full, x_train=x_train, ytime_train=ytime_train, ystatus_train=ystatus_train,device=device))
@@ -410,18 +449,21 @@ def varImportance(model, x_train, ytime_train, ystatus_train, device="cpu"):
     
     theta = predictNewData(model=model, x_test = x_train_ordered, device=device)
 
-    tensor_theta = torch.tensor(theta)
+    if not torch.is_tensor(theta):
+        theta = torch.from_numpy(theta).to(device)
+    else:
+        theta = theta.to(device)
 
-    exp_theta = torch.exp(tensor_theta)
+    exp_theta = torch.exp(theta)
 
-    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_theta, dims=[0]), dims=[0]), dims=[0])
+    risk_sum = torch.flip(torch.cumsum(torch.flip(exp_theta, dims=[0]), dim=0), dims=[0])
 
     log_acc_sum = torch.log(risk_sum)
 
-    PL_train = torch.sum((tensor_theta - log_acc_sum) * ystatus_train_ordered)
+    PL_train = torch.sum((theta - log_acc_sum) * ystatus_train_ordered)
     
     x_train_ordered_np = x_train_ordered.numpy(force=True)
-    PL_mod = np.zeros([x_train_ordered_np.shape[1]])
+    PL_mod = np.zeros([x_train_ordered_np.shape[1]], dtype=np.float64)
     
     for k in range(x_train_ordered_np.shape[1]):
         if (k+1) % 100 == 0:
@@ -433,17 +475,21 @@ def varImportance(model, x_train, ytime_train, ystatus_train, device="cpu"):
     
         new_theta = predictNewData(model=model, x_test = xk_train, device=device)
 
-        tensor_newtheta = torch.tensor(new_theta)
+        if not torch.is_tensor(new_theta):
+            new_theta = torch.from_numpy(new_theta).to(device)
+        else:
+            new_theta = new_theta.to(device)
 
-        exp_newtheta = torch.exp(tensor_newtheta)
+        exp_newtheta = torch.exp(new_theta)
 
-        new_risk_sum = torch.flip(torch.cumsum(torch.flip(exp_newtheta, dims=[0]), dims=[0]), dims=[0])
+        new_risk_sum = torch.flip(torch.cumsum(torch.flip(exp_newtheta, dims=[0]), dim=0), dims=[0])
 
         new_log_acc_sum = torch.log(new_risk_sum)
 
-        PL_mod[k] = torch.sum((tensor_newtheta - new_log_acc_sum) * ystatus_train_ordered)
+        res_sum = torch.sum((new_theta - new_log_acc_sum) * ystatus_train_ordered)
+        PL_mod[k] = res_sum.item()
         
-    return(PL_train - PL_mod)
+    return(PL_train.item() - PL_mod)
     
 # Función para guardar nuestro modelo entrenado en un fichero y no tenerlo que entrenarlo posteriormente
 def saveModel(model, file_name, device):
@@ -454,12 +500,12 @@ def saveModel(model, file_name, device):
     torch.save(model.state_dict(), PATH)
 
 # Función para cargar nuestro modelo entrenado y poder usarlo sin entrenarlo de nuevo
-def loadModel(model,x_train,n_hidden,file_name,device="cpu"):
+def loadModel(model,x_train,node_map,file_name,device="cpu"):
     
     device = device if torch.accelerator.is_available() else "cpu"
 
     n_train = x_train.shape[1]
-    model = CoxMLP(n_input=n_train, n_hidden=n_hidden).to(device)
+    model = CoxMLP(n_input=n_train, node_map=node_map).to(device)
 
     model.load_state_dict(torch.load(file_name))
     model.eval()
